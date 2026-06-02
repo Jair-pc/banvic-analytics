@@ -1,11 +1,59 @@
-# BanVic Analytics — Pipeline ETL Real
+# BanVic Analytics — Pipeline ETL em Camadas (Bronze · Silver · Gold)
 
-Versão **revisada** do Desafio Lighthouse 2024 do BanVic. A primeira entrega (V1) plugava o Power BI direto nos CSVs — funcionava, mas mascarava problemas de qualidade. Esta V2 implementa um **pipeline ETL real** com 2 caminhos de consumo:
+Versão **revisada** do Desafio Lighthouse 2024 do BanVic, agora com um **pipeline ETL real em arquitetura medallion** rodando em Python + Pandas + Parquet. Os dados que aparecem no [Dashboard Web V2](https://github.com/Jair-pc/portfolio_site) saem **deste pipeline** — clone, rode `python -m etl.pipeline`, e o JSON é regenerado a partir dos CSVs brutos.
 
-1. **SQL** sobre PostgreSQL (`stg_banvic`) — para análises ad-hoc e Power BI clássico
-2. **Python (Pandas)** — produz o JSON consumido pelo **[Dashboard Web V2](https://jair-pc.github.io/portfolio_site/projeto-banvic-v2-dashboard.html)** (5 páginas, KPIs em tempo de execução, sem refresh manual)
+> Comparativo com a versão original: ver **[Jair-pc/banvic-v1-powerbi](https://github.com/Jair-pc/banvic-v1-powerbi)** (entrega original em Power BI).
 
-> Os dados que aparecem no Dashboard saem **diretamente deste repo** — clone, rode o ETL, e o JSON regenerado alimenta a interface.
+---
+
+## Arquitetura — Medallion adaptado pra Pandas
+
+```
+                    data/raw/*.csv   (8 CSVs · 4,6 MB)
+                          │
+                          ▼
+                    ┌─────────────┐
+                    │   BRONZE    │   ingestão crua + metadados
+                    │  etl/bronze │   (_source_file, _ingestion_ts, _row_idx)
+                    └──────┬──────┘
+                           │  data/bronze/*.parquet
+                           ▼
+                    ┌─────────────┐
+                    │   SILVER    │   limpeza, tipagem, dedup
+                    │  etl/silver │   + colunas derivadas (idade, faixa, ano/mês)
+                    └──────┬──────┘
+                           │  data/silver/*.parquet
+                           ▼
+                    ┌─────────────┐
+                    │    GOLD     │   5 fact tables + dims
+                    │  etl/gold   │   + JSON compacto pro Dashboard
+                    └──────┬──────┘
+                           │
+              ┌────────────┴────────────┐
+              ▼                         ▼
+        data/gold/*.parquet      output/banvic_v2_report.json
+        (auditoria/BI)           (Dashboard Web V2)
+
+                ┌─────────────────────────┐
+                │  etl/validate           │  ← roda após cada camada
+                │  8 data quality checks  │     (PKs, datas, totais, JSON keys)
+                └─────────────────────────┘
+```
+
+---
+
+## Por que medallion (e não fazer tudo num script só)
+
+A V1 fazia toda a transformação dentro do Power BI (Power Query). A V2 inicial fazia tudo em um único script Python. **Nenhum dos dois é ETL**. Pipeline real precisa de:
+
+| Característica | Script único | Pipeline medallion |
+|---|---|---|
+| Reprocessar só a etapa que mudou | ❌ refaz tudo | ✅ `--only silver` |
+| Auditoria do estado intermediário | ❌ memória | ✅ Parquet em cada camada |
+| Detectar regressão (data quality) | ❌ | ✅ `etl/validate.py` |
+| Falha numa etapa não corrompe a próxima | ❌ | ✅ isolamento por camada |
+| Logging estruturado | ❌ print | ✅ `logs/etl_YYYYMMDD.log` |
+| Plugar nova fonte | ❌ refactor | ✅ adicionar 1 entrada em `RAW_TABLES` |
 
 ---
 
@@ -14,140 +62,159 @@ Versão **revisada** do Desafio Lighthouse 2024 do BanVic. A primeira entrega (V
 ```
 banvic-analytics/
 ├── data/
-│   └── raw/                    # 8 CSVs brutos do Desafio Lighthouse + IPCA externo
-│       ├── agencias.csv
-│       ├── clientes.csv
-│       ├── colaboradores.csv
-│       ├── colaborador_agencia.csv
-│       ├── contas.csv
-│       ├── propostas_credito.csv
-│       ├── transacoes.csv      # 4,1 MB · ~72k transações
-│       └── ipca.csv            # dado externo (IBGE/Sidra)
-├── sql/
-│   ├── 01_schema_stg_banvic.sql    # CREATE TABLE com PK/FK
-│   ├── 02_etl_carga_inicial.sql    # \copy dos CSVs + validação
-│   ├── 03_analise_clientes.sql     # perfil, faixa etária, saldo
-│   ├── 04_analise_credito.sql      # taxas, prazo, status
-│   ├── 05_analise_ipca.sql         # IPCA × saques × crédito (corr())
-│   └── 06_analise_transacoes.sql   # KPIs, sazonalidade, YoY (LAG)
-├── python/
-│   ├── build_dashboard_data.py     # ETL Python → JSON do Dashboard
-│   └── requirements.txt
+│   ├── raw/                          # 8 CSVs brutos (~4,6 MB)
+│   ├── bronze/                       # ingestão crua + metadados (parquet)
+│   ├── silver/                       # limpa, tipada, dedup (parquet)
+│   └── gold/                         # facts + dims agregados (parquet)
+├── etl/
+│   ├── __init__.py
+│   ├── config.py                     # paths, encodings, dims
+│   ├── logger.py                     # logger compartilhado (arquivo + stdout)
+│   ├── bronze.py                     # raw → bronze
+│   ├── silver.py                     # bronze → silver
+│   ├── gold.py                       # silver → gold (+ JSON)
+│   ├── validate.py                   # 8 checks de qualidade
+│   └── pipeline.py                   # orquestrador
+├── sql/                              # caminho alternativo PostgreSQL (Power BI)
+│   ├── 01_schema_stg_banvic.sql
+│   ├── 02_etl_carga_inicial.sql
+│   ├── 03_analise_clientes.sql
+│   ├── 04_analise_credito.sql
+│   ├── 05_analise_ipca.sql
+│   └── 06_analise_transacoes.sql
 ├── output/
-│   └── banvic_v2_report.json       # ~180 KB · alimenta o Dashboard Web V2
+│   └── banvic_v2_report.json         # ~180 KB · consumido pelo Dashboard Web
+├── logs/                             # logs estruturados de cada execução
+├── docs/arquitetura.webp
+├── requirements.txt
 └── README.md
 ```
 
 ---
 
-## Pipeline (visão arquitetural)
+## Como rodar
 
-```
-            ┌──────────────────┐
-            │  data/raw/*.csv  │  ← Desafio Lighthouse 2024 + IPCA IBGE
-            └────────┬─────────┘
-                     │
-        ┌────────────┴────────────┐
-        ▼                         ▼
-┌───────────────┐         ┌────────────────────┐
-│   sql/        │         │   python/          │
-│   PostgreSQL  │         │   Pandas ETL       │
-│   stg_banvic  │         │   build_dashboard… │
-│   (Power BI)  │         │                    │
-└──────┬────────┘         └─────────┬──────────┘
-       │                            │
-       ▼                            ▼
-┌──────────────┐         ┌──────────────────────┐
-│   Power BI   │         │ output/              │
-│   (.pbix)    │         │ banvic_v2_report.json│
-└──────────────┘         └──────────┬───────────┘
-                                    │
-                                    ▼
-                         ┌──────────────────────┐
-                         │  Dashboard Web V2    │
-                         │  (HTML + Chart.js)   │
-                         └──────────────────────┘
-```
-
----
-
-## Caminho 1 — SQL via PostgreSQL
-
-Boa para quem vai consumir via Power BI, Metabase ou queries ad-hoc.
-
+### 1. Setup
 ```bash
-# Subir um PostgreSQL local (Docker exemplo):
-docker run --name banvic-pg -e POSTGRES_PASSWORD=secret -p 5432:5432 -d postgres:16
-
-# Criar banco e schema
-createdb banvic
-psql banvic -f sql/01_schema_stg_banvic.sql
-
-# Copiar CSVs pra um path acessível pelo psql e carregar
-psql banvic -f sql/02_etl_carga_inicial.sql
-
-# Rodar as 4 análises temáticas
-psql banvic -f sql/03_analise_clientes.sql
-psql banvic -f sql/04_analise_credito.sql
-psql banvic -f sql/05_analise_ipca.sql
-psql banvic -f sql/06_analise_transacoes.sql
+git clone https://github.com/Jair-pc/banvic-analytics.git
+cd banvic-analytics
+pip install -r requirements.txt
 ```
 
-### O que os scripts SQL demonstram
-- **Modelagem relacional** com PK/FK (`REFERENCES`)
-- **`COUNT(*) FILTER (WHERE …)`** em vez de `CASE` aninhado
-- **CTEs encadeadas** + **window functions** (`LAG()` para YoY, `SUM() OVER` para acumulado)
-- **`corr()` nativa** do PostgreSQL para correlação IPCA × volume de saques
-- **`\copy` do psql** para carga rápida sem permissão de servidor
-
----
-
-## Caminho 2 — Python ETL → JSON do Dashboard
-
+### 2. Pipeline completo (bronze → silver → gold → validate)
 ```bash
-# Instalar dependencias
-pip install -r python/requirements.txt
-
-# Rodar o ETL (le data/raw/, escreve output/banvic_v2_report.json)
-python python/build_dashboard_data.py
+python -m etl.pipeline
 ```
 
 Saída esperada:
 ```
-OK  saida=output/banvic_v2_report.json  (182 KB)
-txEvo rows: 2328  txType: 2139  cliFact: 206  propFact: 787  propRaw: 2000
-tipos: ['Compra Crédito', 'Compra Débito', 'Pix - Realizado', …]
-saldoTotal R$: 26516864
-agencias: ['Matriz', 'Tatuapé', 'Campinas', 'Osasco', 'Porto Alegre', …]
+2026-06-02 08:01:20 INFO [pipeline] >>> START bronze
+2026-06-02 08:01:20 INFO [bronze] [agencias] 10 linhas (enc=utf-8-sig) -> agencias.parquet
+2026-06-02 08:01:20 INFO [bronze] [clientes] 998 linhas (enc=utf-8-sig) -> clientes.parquet
+2026-06-02 08:01:20 INFO [bronze] [transacoes] 71,999 linhas (enc=utf-8-sig) -> transacoes.parquet
+...
+2026-06-02 08:01:28 INFO [pipeline] >>> START gold
+2026-06-02 08:01:28 INFO [gold] [fact_tx_evolucao] 2,288 linhas -> fact_tx_evolucao.parquet
+2026-06-02 08:01:29 INFO [gold] JSON gravado: banvic_v2_report.json (181 KB)
+2026-06-02 08:01:29 INFO [gold] GOLD DONE · saldoTotal R$ 26,516,864 · agencias=10 · txEvo=2288
+2026-06-02 08:01:29 INFO [pipeline] >>> START validate
+2026-06-02 08:01:29 INFO [validate] [PASS] bronze.files: bronze: 8 arquivos presentes
+2026-06-02 08:01:29 INFO [validate] [PASS] silver.pks: silver: PKs distintas em todas as tabelas
+2026-06-02 08:01:29 INFO [validate] [PASS] gold.totals_match: silver=71,999 ~ gold=71,999
+2026-06-02 08:01:29 INFO [validate] VALIDATE DONE · passed=8/8
+2026-06-02 08:01:29 INFO [pipeline] BANVIC ETL · sucesso em 9.31s
 ```
 
-### Estrutura do JSON
-| Chave | Descrição |
-|---|---|
-| `dims` | Agências, faixas etárias, estados, tipos de transação, faixas de juros, **totais consolidados** (clientes, contas, colaboradores, saldo total) |
-| `txEvo` | Fact compacta de transações por (ano, mês, agência, faixa etária) → contagem + volume |
-| `txType` | Fact por (ano, agência, faixa, tipo de transação) |
-| `cliFact` | Fact de clientes por (agência, faixa, estado, ano de inclusão) |
-| `propFact` | Fact de propostas de crédito por (ano, agência, faixa, status) |
-| `propRaw` | Propostas raw para o scatter taxa × valor |
-| `ipcaSer` | Série mensal do IPCA |
-| `saqueFact` | Fact de saques por mês para análise de correlação |
-| `tempo` | Estatísticas para a página de padrões temporais (incl. exclusão dos dias de dump artificial em dez/22) |
-
-### Decisões de modelagem
-- **`dim_date` construída em runtime:** trimestre, dia-da-semana, mês com/sem "R", par/ímpar
-- **Dump artificial de fim de 2022:** identificado e **excluído** das análises de sazonalidade para não distorcer padrões reais
-- **Faixa etária do cliente** propagada para cada transação via JOIN `transacoes → contas → clientes`
-- **Estado** do cliente derivado da agência da conta (CSV `clientes.csv` não tem UF própria)
+### 3. Re-rodar só uma camada
+```bash
+python -m etl.pipeline --only gold        # re-agrega sem re-ingerir
+python -m etl.pipeline --only validate    # só os data quality checks
+python -m etl.pipeline --skip-bronze      # bronze já está OK, refaz dali pra frente
+```
 
 ---
 
-## Achados principais
+## O que cada camada faz
+
+### Bronze (`etl/bronze.py`)
+- Lê CSVs de `data/raw/`
+- **Tenta UTF-8-BOM, UTF-8, Latin-1** nessa ordem (pegadinha do dataset Lighthouse)
+- **Não transforma nada** — mantém os dados como vieram
+- Adiciona `_source_file`, `_ingestion_ts`, `_row_idx` a cada linha
+- Escreve `data/bronze/<tabela>.parquet`
+
+### Silver (`etl/silver.py`)
+- Lê parquets de `data/bronze/`
+- **Tipa colunas** (datas, numéricos)
+- **Dedup** por PK em cada tabela
+- **Adiciona colunas derivadas** estáveis:
+  - `agencias.nome_short` ("Agência Matriz" → "Matriz")
+  - `clientes.idade`, `clientes.faixa_etaria`
+  - `transacoes.valor_abs`, `transacoes.ano`, `transacoes.mes`, `transacoes.dia_semana`
+  - `propostas.ano`
+  - `ipca.mn` (mês em número)
+- Escreve `data/silver/<tabela>.parquet`
+
+### Gold (`etl/gold.py`)
+- Lê parquets de `data/silver/`
+- **Cria 5 fact tables compactas:**
+  - `fact_tx_evolucao(ano, mes, agencia, faixa) → qtd, volume`
+  - `fact_tx_tipo(ano, agencia, faixa, tipo) → qtd, volume`
+  - `fact_clientes(agencia, faixa, estado, ano_inc) → qtd, saldo`
+  - `fact_propostas(ano, agencia, faixa, status) → 6 agregados`
+  - `fact_saques(ano, mes, agencia, faixa) → volume`
+- **Cria os dims** (agências, faixas, estados, tipos, totais)
+- **Análise temporal extra**: identifica o **dump artificial de fim de 2022** (dias com `> 200` transações) e exclui das análises de padrão
+- Serializa o JSON compacto consumido pelo Dashboard Web V2
+
+### Validate (`etl/validate.py`)
+8 data quality checks executados após Gold:
+
+| Check | O que faz |
+|---|---|
+| `bronze.files` | Confirma que os 8 parquets bronze existem |
+| `bronze.non_empty` | Nenhuma tabela bronze veio vazia |
+| `silver.pks` | PKs únicas em agencias / clientes / contas / transacoes / propostas / colaboradores |
+| `silver.dates` | Toda transação com `data_transacao` válida |
+| `silver.saldos` | Reporta contas com saldo negativo / null (informativo) |
+| `gold.facts` | 5 fact tables existem |
+| `gold.totals_match` | Total de transações em `fact_tx_evolucao` bate com silver |
+| `gold.json_keys` | JSON final tem as 9 chaves esperadas pelo Dashboard |
+
+Falhas viram código de saída `2` (pra integrar com CI).
+
+---
+
+## Logging
+
+Cada execução grava em `logs/etl_YYYYMMDD.log`. Formato:
+```
+2026-06-02 08:01:28 INFO    [gold] JSON gravado: banvic_v2_report.json (181 KB)
+2026-06-02 08:01:29 INFO    [validate] [PASS] gold.totals_match: silver=71,999 ~ gold=71,999
+```
+
+Os logs ecoam no stdout também (útil em CI / `crontab`).
+
+---
+
+## Caminho alternativo — SQL via PostgreSQL
+
+Para quem prefere consumir via Power BI / Metabase clássico, os scripts em `sql/` reproduzem o mesmo trabalho em **PostgreSQL puro** (`stg_banvic` schema com PK/FK). Os números entre os dois caminhos são consistentes — clone o repo, rode os dois e compare.
+
+```bash
+createdb banvic
+psql banvic -f sql/01_schema_stg_banvic.sql
+psql banvic -f sql/02_etl_carga_inicial.sql
+psql banvic -f sql/03_analise_clientes.sql      # ... e os outros 3
+```
+
+---
+
+## Achados principais (consumidos pelo Dashboard)
 
 ### Clientes (998 PF)
 - **Idade média:** 51,8 anos
 - **100% pessoa física** — sem PJ na carteira
-- Concentração em SP (Matriz + Tatuapé + Campinas + Osasco)
 
 ### Crédito (2.000 propostas)
 - **Taxa média:** 1,67% a.m. (~22% a.a.)
@@ -156,38 +223,40 @@ agencias: ['Matriz', 'Tatuapé', 'Campinas', 'Osasco', 'Porto Alegre', …]
 ### IPCA × Comportamento
 - **IPCA acumulado 2020-2022:** 19,11%
 - **Pico mensal:** 1,62% em mar/2022
-- Correlação testada entre IPCA mensal e volume de saques
 
 ### Transações (72k / 2010-2023)
 - **Saldo total em carteira:** R$ 26.516.864
 - **Tipo mais frequente:** Compra Crédito
-- Variação YoY calculada com `LAG()` window function
-- **Dump artificial em dez/22** identificado e excluído nas análises temporais
+- **Dump artificial em dez/22** detectado e excluído das análises temporais
 
 ---
 
 ## Stack
 
 | Camada | Tecnologia |
-|--------|-----------|
-| Raw / armazenamento | CSV (Desafio Lighthouse) |
-| ETL SQL | PostgreSQL 14+ · psql `\copy` |
-| ETL Python | Python 3.11+ · Pandas · NumPy |
-| Consumo BI | Power BI Desktop (via stg_banvic) |
-| Consumo Web | Dashboard HTML + Chart.js (via JSON) |
+|---|---|
+| Storage colunar | Parquet (via PyArrow) |
+| ETL | Python 3.11+ · Pandas 2 · NumPy |
+| DQ checks | Funções puras + SciPy (t-test em padrões temporais) |
+| Logging | `logging` stdlib (arquivo + stdout) |
+| Orquestração | CLI `argparse` + `python -m etl.pipeline` |
+| Consumo BI clássico | PostgreSQL + Power BI |
+| Consumo Web | HTML + Chart.js (le `output/banvic_v2_report.json`) |
 
 ---
 
-## Por que dois caminhos?
+## Próximos passos possíveis
 
-| | Caminho SQL | Caminho Python |
-|---|---|---|
-| **Audiência** | BI Analyst / Power BI | Recrutador no portfólio web |
-| **Output** | Tabelas tipadas | JSON pronto pra renderizar |
-| **Refresh** | Manual (Power BI) | A cada deploy do site |
-| **Vantagem** | Governança, queries ad-hoc | Zero infra — abre no navegador |
+Coisas que um projeto em produção teria e que ficaram fora do escopo aqui:
 
-Os dois consomem a mesma `data/raw/` e produzem **as mesmas métricas** — mudou apenas a forma de entrega.
+- [ ] **Airflow / Prefect** como orquestrador (em vez de CLI manual)
+- [ ] **Great Expectations** ou **pandera** pros checks (em vez de funções soltas)
+- [ ] **Schedule diário** com cron / GitHub Actions
+- [ ] **Incremental load** na silver (hoje é full refresh)
+- [ ] **Particionamento por ano** nos parquets grandes (transacoes)
+- [ ] **dbt** rodando sobre PostgreSQL (no caminho SQL)
+
+Cada um desses é um upgrade incremental sobre a base atual — a arquitetura medallion abre caminho pra eles.
 
 ---
 
@@ -195,3 +264,5 @@ Os dois consomem a mesma `data/raw/` e produzem **as mesmas métricas** — mudo
 
 **Jair Pereira da Silva Júnior** — Analista de Dados
 GitHub: [@Jair-pc](https://github.com/Jair-pc) · [Portfólio](https://github.com/Jair-pc/portfolio_site)
+
+> Desafio fictício criado pela **Lighthouse / Indicium** para o programa de Engenharia de Analytics 2024.
